@@ -1,0 +1,107 @@
+// api/system — facade over SystemService bindings.
+import { SystemService } from '../../bindings/sqlport/internal/services'
+import type { FileFilterDescriptor as BoundFileFilter } from '../../bindings/sqlport/internal/services/models'
+import { on } from './events'
+
+export type FileFilter = BoundFileFilter
+
+export function pickSaveFile(title: string, defaultName: string, filters: FileFilter[] = []): Promise<string> {
+  return SystemService.PickSaveFile(title, defaultName, filters) as unknown as Promise<string>
+}
+export function pickOpenFile(title: string, filters: FileFilter[] = []): Promise<string> {
+  return SystemService.PickOpenFile(title, filters) as unknown as Promise<string>
+}
+export function showInfo(title: string, message: string): Promise<void> {
+  return SystemService.ShowInfo(title, message) as unknown as Promise<void>
+}
+export function showError(title: string, message: string): Promise<void> {
+  return SystemService.ShowError(title, message) as unknown as Promise<void>
+}
+export function setDirtyTabs(count: number): Promise<void> {
+  return SystemService.SetDirtyTabs(count) as unknown as Promise<void>
+}
+export function allowNextClose(): Promise<void> {
+  return SystemService.AllowNextClose() as unknown as Promise<void>
+}
+export function openConnectionEditor(driver: string, connId = ''): Promise<void> {
+  return SystemService.OpenConnectionEditor(driver, connId) as unknown as Promise<void>
+}
+export function broadcastConnectionSaved(connId: string): Promise<void> {
+  return SystemService.BroadcastConnectionSaved(connId) as unknown as Promise<void>
+}
+export function openDatabaseEditor(connId: string, dbName = ''): Promise<void> {
+  return SystemService.OpenDatabaseEditor(connId, dbName) as unknown as Promise<void>
+}
+export function openTransferDialog(): Promise<void> {
+  return SystemService.OpenTransferDialog() as unknown as Promise<void>
+}
+export function openStructureSyncDialog(): Promise<void> {
+  return SystemService.OpenStructureSyncDialog() as unknown as Promise<void>
+}
+export function openDataSyncDialog(): Promise<void> {
+  return SystemService.OpenDataSyncDialog() as unknown as Promise<void>
+}
+export function broadcastDatabaseSaved(connId: string, dbName: string): Promise<void> {
+  return SystemService.BroadcastDatabaseSaved(connId, dbName) as unknown as Promise<void>
+}
+export function openExternalURL(url: string): Promise<void> {
+  return SystemService.OpenExternalURL(url) as unknown as Promise<void>
+}
+/**
+ * Copy text to the system clipboard via the native (Go) side. The WebView's
+ * navigator.clipboard is permission-gated — WKWebView rejects it with
+ * NotAllowedError — so every copy action in the app goes through here.
+ */
+export function copyText(text: string): Promise<void> {
+  return SystemService.CopyToClipboard(text) as unknown as Promise<void>
+}
+export function openSettingsWindow(section = ''): Promise<void> {
+  return SystemService.OpenSettingsWindow(section) as unknown as Promise<void>
+}
+export type LocaleChangedPayload = { locale: string }
+export function onLocaleChanged(cb: (p: LocaleChangedPayload) => void): () => void {
+  return on<LocaleChangedPayload>('app:locale-changed', cb)
+}
+
+export type ConnectionSavedPayload = { id: string }
+export function onConnectionSaved(cb: (p: ConnectionSavedPayload) => void): () => void {
+  return on<ConnectionSavedPayload>('connection:saved', cb)
+}
+
+export type DatabaseSavedPayload = { connId: string; db: string }
+export function onDatabaseSaved(cb: (p: DatabaseSavedPayload) => void): () => void {
+  return on<DatabaseSavedPayload>('database:saved', cb)
+}
+
+export type CloseBlockedPayload = { dirtyTabs: number }
+export function onCloseBlocked(cb: (p: CloseBlockedPayload) => void): () => void {
+  return on<CloseBlockedPayload>('window:close-blocked', cb)
+}
+
+export type MenuCommand =
+  | 'menu:new-tab'
+  | 'menu:close-tab'
+  | 'menu:save-sql'
+  | 'menu:open-sql'
+  | 'menu:export-result'
+  | 'menu:import'
+  | 'menu:find'
+  | 'menu:toggle-sidebar'
+  | 'menu:run-query'
+  | 'menu:run-selection'
+  | 'menu:explain'
+  | 'menu:cancel-query'
+  | 'menu:open-docs'
+
+export function onMenu(cmd: MenuCommand, cb: () => void): () => void {
+  return on<null>(cmd, cb)
+}
+
+// Native "View ▸ Language" menu — each item Emits `menu:set-locale:<code>`.
+// onSetLocale subscribes to every supported locale's event and reports the
+// chosen code. Returns a combined unsubscribe.
+const LOCALE_MENU_CODES = ['en-US', 'zh-CN'] as const
+export function onSetLocale(cb: (locale: string) => void): () => void {
+  const offs = LOCALE_MENU_CODES.map((code) => on<null>(`menu:set-locale:${code}`, () => cb(code)))
+  return () => offs.forEach((off) => off())
+}

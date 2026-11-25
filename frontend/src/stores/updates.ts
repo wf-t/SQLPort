@@ -1,0 +1,258 @@
+// Updates store — owns the "is there a new release?" state and the install
+// flow. Components only see the store; the GitHub API call + DMG / EXE
+// download happens in Go via UpdateService.
+import { defineStore } from 'pinia'
+import { computed, ref, watch } from 'vue'
+import { update as updateApi } from '../api'
+import type { UpdateChannel } from '../api/update'
+
+export type UpdatePhase = 'idle' | 'downloading' | 'downloaded' | 'installing' | 'ready' | 'error'
+
+const APP_VERSION = (import.meta.env.VITE_APP_VERSION as string) || 'dev'
+
+// Auto-check cadence: once shortly after startup, then every 8 hours in the
+// background. The persisted min-interval gate sits just under the timer
+// period so a periodic firing is never skipped by its own previous run.
+const STARTUP_DELAY_MS = 10_000
+const CHECK_INTERVAL_MS = 8 * 60 * 60 * 1000
+const MIN_RECHECK_MS = CHECK_INTERVAL_MS - 10 * 60 * 1000
+
+export const useUpdatesStore = defineStore('updates', () => {
+  const currentVersion = ref(APP_VERSION)
+  const enabled = ref(false)
+  const availability = APP_VERSION === 'dev'
+    ? Promise.resolve(false)
+    : updateApi.isEnabled().catch(() => false)
+  void availability.then((configured) => { enabled.value = configured })
+  const latestVersion = ref('')
+  const releaseNotes = ref('')
+  const releaseUrl = ref('')
+  const publishedAt = ref('')
+  const assetName = ref('')
+  const hasAsset = ref(false)
+  const available = ref(false)
+  const skipped = ref(false)
+  // Whether the latest release is a GitHub prerelease (Beta). Set from each
+  // check result; UpdateDialog shows a "Beta" badge when true.
+  const prerelease = ref(false)
+  const lastCheckedAt = ref<number | null>(null)
+  const lastError = ref('')
+
+  // Effective update channel ('stable' | 'beta'). Loaded from Go on first use
+  // (skipped in dev builds); the user can switch it in the settings window.
+  const channel = ref<UpdateChannel>('stable')
+  let channelLoaded = false
+
+  // dialog visibility — UpdateDialog binds to this. Setting true brings the
+  // dialog up; setting false closes it without affecting any other state.
+  const dialogOpen = ref(false)
+
+  // install progress
+  const phase = ref<UpdatePhase>('idle')
+  const downloaded = ref(0)
+  const total = ref(0)
+  // Locale-independent status/error slug from Go (e.g. 'fetch-failed'); the
+  // UpdateDialog maps it to a localized message via error.update.*.
+  const errorCode = ref('')
+
+  let unsubscribe: (() => void) | null = null
+
+  // Wails dispatches each Go-side Emit to the WebView on its own goroutine, so
+  // back-to-back events can arrive out of order (a final "downloading" tick
+  // overtaking "downloaded" wedges the UI in the spinner forever). Rank the
+  // phases and drop any event that would move the phase backwards; forward
+  // transitions and same-phase progress updates pass through.
+  const PHASE_RANK: Record<UpdatePhase, number> = {
+    idle: 0,
+    downloading: 1,
+    downloaded: 2,
+    installing: 3,
+    ready: 4,
+    error: 5,
+  }
+
+  function attachProgress() {
+    if (unsubscribe) return
+    unsubscribe = updateApi.onUpdateProgress((p) => {
+      if (!(p.phase in PHASE_RANK) || PHASE_RANK[p.phase] < PHASE_RANK[phase.value]) return
+      phase.value = p.phase
+      if (typeof p.downloaded === 'number') downloaded.value = p.downloaded
+      if (typeof p.total === 'number') total.value = p.total
+      if (p.code) errorCode.value = p.code
+      if (p.error) lastError.value = p.error
+    })
+  }
+
+  // loadChannel fills `channel` from the persisted setting once.
+  async function loadChannel(): Promise<void> {
+    if (channelLoaded) return
+    if (!(await availability)) return
+    try {
+      channel.value = await updateApi.getChannel(currentVersion.value)
+      channelLoaded = true
+    } catch {
+      // Non-fatal — keep the default 'stable' and retry on next call.
+    }
+  }
+
+  // setChannel persists the user's choice and re-checks immediately. The forced
+  // check bypasses the min-interval throttle so switching channels reflects the
+  // new channel's latest release right away.
+  async function setChannel(ch: UpdateChannel): Promise<void> {
+    await updateApi.setChannel(ch)
+    channel.value = ch
+    channelLoaded = true
+    void check(true)
+  }
+
+  // force=true performs a real check unconditionally — used by the manual
+  // "check for updates" click. The default (false) keeps the min-interval
+  // throttle for the automatic checks (startup + 8h background timer).
+  async function check(force = false): Promise<boolean> {
+    if (!(await availability)) return false
+
+    // Min-interval gate: skip if the last successful check was recent.
+    // The persisted value is an ISO timestamp (older builds stored a plain
+    // YYYY-MM-DD — Date.parse still handles it; unparseable → treat as stale).
+    // A manual click (force) bypasses this for a fresh result.
+    if (!force) {
+      try {
+        const last = Date.parse(await updateApi.getLastCheckDate())
+        if (!Number.isNaN(last) && Date.now() - last < MIN_RECHECK_MS) return false
+      } catch {
+        // Swallow — stale/missing setting is non-fatal; just proceed.
+      }
+    }
+
+    // Make sure the effective channel is loaded before checking so the store
+    // exposes it consistently once any check has run.
+    await loadChannel()
+
+    lastError.value = ''
+    try {
+      const res = await updateApi.checkForUpdate(currentVersion.value)
+      // Persist the check time after a successful check.
+      await updateApi.setLastCheckDate(new Date().toISOString()).catch(() => {})
+      latestVersion.value = res.latestVersion
+      releaseNotes.value = res.releaseNotes
+      releaseUrl.value = res.releaseUrl
+      publishedAt.value = res.publishedAt
+      assetName.value = res.assetName
+      hasAsset.value = res.hasAsset
+      available.value = res.available
+      skipped.value = res.skipped
+      prerelease.value = res.prerelease
+      lastCheckedAt.value = Date.now()
+      return res.available
+    } catch (e) {
+      lastError.value = e instanceof Error ? e.message : String(e)
+      return false
+    }
+  }
+
+  async function skipCurrent(): Promise<void> {
+    if (!latestVersion.value) return
+    await updateApi.skipVersion(latestVersion.value)
+    skipped.value = true
+    available.value = false
+    dialogOpen.value = false
+  }
+
+  // download fetches the release asset and stages it — the app keeps running.
+  // Ends in phase 'downloaded'; the actual install waits for the user to
+  // trigger restartAndInstall (重启并更新).
+  async function download(): Promise<void> {
+    attachProgress()
+    phase.value = 'downloading'
+    downloaded.value = 0
+    total.value = 0
+    errorCode.value = ''
+    lastError.value = ''
+    try {
+      await updateApi.downloadUpdate(currentVersion.value)
+      // The call resolving is the authoritative success signal — don't depend
+      // on the "downloaded" event alone (its dispatch may lose the goroutine
+      // race against the last progress tick, or get dropped entirely).
+      if (phase.value === 'downloading') phase.value = 'downloaded'
+    } catch (e) {
+      phase.value = 'error'
+      lastError.value = e instanceof Error ? e.message : String(e)
+    }
+  }
+
+  // restartAndInstall hands the staged download to the platform installer
+  // (silent) and quits the app — only call from an explicit user action.
+  async function restartAndInstall(): Promise<void> {
+    attachProgress()
+    phase.value = 'installing'
+    errorCode.value = ''
+    lastError.value = ''
+    try {
+      await updateApi.restartAndInstall()
+      // Same fallback as download(): the resolved call means Go reached
+      // "ready" — the app quits ~800ms later.
+      if (phase.value === 'installing') phase.value = 'ready'
+    } catch (e) {
+      phase.value = 'error'
+      lastError.value = e instanceof Error ? e.message : String(e)
+    }
+  }
+
+  // startAutoCheck wires the automatic cadence: one check shortly after
+  // startup (throttled by the persisted min-interval gate), then a background
+  // re-check every 8 hours. Returns a cleanup function for the caller's
+  // unmount hook.
+  function startAutoCheck(): () => void {
+    return watch(enabled, (configured, _, onCleanup) => {
+      if (!configured) return
+      const startupTimer = window.setTimeout(() => { void check() }, STARTUP_DELAY_MS)
+      const intervalTimer = window.setInterval(() => { void check() }, CHECK_INTERVAL_MS)
+      onCleanup(() => {
+        window.clearTimeout(startupTimer)
+        window.clearInterval(intervalTimer)
+      })
+    }, { immediate: true })
+  }
+
+  function openDialog() {
+    dialogOpen.value = true
+  }
+  function closeDialog() {
+    dialogOpen.value = false
+  }
+
+  // Convenience — true when the StatusBar badge dot should be visible.
+  const hasBadge = computed(() => available.value && !skipped.value)
+
+  return {
+    currentVersion,
+    enabled,
+    latestVersion,
+    releaseNotes,
+    releaseUrl,
+    publishedAt,
+    assetName,
+    hasAsset,
+    available,
+    skipped,
+    prerelease,
+    channel,
+    lastCheckedAt,
+    lastError,
+    dialogOpen,
+    phase,
+    downloaded,
+    total,
+    errorCode,
+    hasBadge,
+    check,
+    loadChannel,
+    setChannel,
+    startAutoCheck,
+    skipCurrent,
+    download,
+    restartAndInstall,
+    openDialog,
+    closeDialog,
+  }
+})
